@@ -1,0 +1,1107 @@
+{
+ "datasets": [
+  {
+   "name": "ds_daily",
+   "displayName": "ds_daily",
+   "queryLines": [
+    "SELECT event_date, dataset, rows_in, rows_clean AS rows_passed, rows_dropped, rows_quarantined FROM dq_daily WHERE rule_name = '__all__' ORDER BY event_date"
+   ],
+   "columns": [
+    {
+     "displayName": "Passed share",
+     "expression": "SUM(`rows_passed`) / SUM(`rows_in`)"
+    },
+    {
+     "displayName": "Dropped share",
+     "expression": "SUM(`rows_dropped`) / SUM(`rows_in`)"
+    },
+    {
+     "displayName": "Quarantined share",
+     "expression": "SUM(`rows_quarantined`) / SUM(CASE WHEN `dataset` IN ('calls', 'quality_scores') THEN `rows_in` END)"
+    }
+   ]
+  },
+  {
+   "name": "ds_daily_stages",
+   "displayName": "ds_daily_stages",
+   "queryLines": [
+    "SELECT event_date, dataset, stage, rows FROM (SELECT event_date, dataset, stack(2, 'passed', rows_clean, 'dropped', rows_dropped) AS (stage, rows) FROM dq_daily WHERE rule_name = '__all__') ORDER BY event_date"
+   ]
+  },
+  {
+   "name": "ds_rule_failures",
+   "displayName": "ds_rule_failures",
+   "queryLines": [
+    "SELECT event_date, dataset, rule_name, action, rows_failed AS failures FROM dq_daily WHERE rule_name <> '__all__' UNION ALL SELECT to_date(event_ts) AS event_date, CASE WHEN table_name LIKE 'calls%' THEN 'calls' WHEN table_name LIKE 'transcripts%' THEN 'transcripts' WHEN table_name LIKE 'quality_scores%' THEN 'quality_scores' ELSE table_name END AS dataset, concat(expectation, ' (failed updates)') AS rule_name, 'fail' AS action, 1 AS failures FROM dq_pipeline_failures WHERE expectation IS NOT NULL"
+   ]
+  },
+  {
+   "name": "ds_rate_hourly",
+   "displayName": "ds_rate_hourly",
+   "queryLines": [
+    "WITH m AS (SELECT date_trunc('HOUR', event_ts) AS hour, CASE WHEN dataset LIKE 'calls%' THEN 'calls' WHEN dataset LIKE 'transcripts%' THEN 'transcripts' WHEN dataset LIKE 'quality_scores%' THEN 'quality_scores' ELSE dataset END AS dataset, concat(dataset, '.', expectation) AS rule, sum(failed_records) AS failed, sum(passed_records + failed_records) AS total FROM dq_expectation_metrics WHERE dataset NOT IN ('daily_call_checks') GROUP BY ALL), top AS (SELECT rule FROM m GROUP BY rule ORDER BY sum(failed) DESC LIMIT 8) SELECT hour, to_date(hour) AS event_date, dataset, rule, failed, total, failed / nullif(total, 0) AS failure_rate FROM m WHERE rule IN (SELECT rule FROM top) AND total > 0 ORDER BY hour"
+   ]
+  },
+  {
+   "name": "ds_quarantine",
+   "displayName": "ds_quarantine",
+   "queryLines": [
+    "WITH q AS (SELECT _loaded_at, 'calls' AS dataset, call_id, failed_rules, concat('agent=', coalesce(agent_id,'null'), ' queue=', coalesce(queue,'null'), ' duration_s=', coalesce(cast(duration_seconds AS STRING),'null'), ' start=', coalesce(cast(call_start_ts AS STRING),'null'), ' end=', coalesce(cast(call_end_ts AS STRING),'null')) AS key_columns, _source_file FROM calls_quarantine UNION ALL SELECT _loaded_at, 'quality_scores', call_id, failed_rules, concat('empathy=', coalesce(cast(empathy_score AS STRING),'null'), ' resolution=', coalesce(cast(resolution_score AS STRING),'null'), ' compliance=', coalesce(cast(compliance_score AS STRING),'null'), ' output=', left(coalesce(raw_model_output,'null'), 60)) AS key_columns, _source_file FROM quality_scores_quarantine) SELECT _loaded_at, to_date(_loaded_at) AS event_date, dataset, call_id, explode(failed_rules) AS rule_name, key_columns, element_at(split(_source_file, '/'), -1) AS source_file FROM q ORDER BY _loaded_at DESC LIMIT 2000"
+   ]
+  },
+  {
+   "name": "ds_failures",
+   "displayName": "ds_failures",
+   "queryLines": [
+    "SELECT event_ts, to_date(event_ts) AS event_date, CASE WHEN table_name LIKE 'calls%' THEN 'calls' WHEN table_name LIKE 'transcripts%' THEN 'transcripts' WHEN table_name LIKE 'quality_scores%' THEN 'quality_scores' ELSE table_name END AS dataset, pipeline, coalesce(expectation, 'stream error') AS expectation, table_name, coalesce(example_record, left(error_message, 200)) AS example_record FROM dq_pipeline_failures ORDER BY event_ts DESC"
+   ]
+  }
+ ],
+ "pages": [
+  {
+   "name": "overview",
+   "displayName": "Data quality",
+   "pageType": "PAGE_TYPE_CANVAS",
+   "layoutVersion": "GRID_V1",
+   "layout": [
+    {
+     "widget": {
+      "name": "header",
+      "multilineTextboxSpec": {
+       "lines": [
+        "## Contact center data quality: what passed, what was stopped, and why\n",
+        "\n",
+        "Rules live next to the pipeline code; each one warns, drops (to a quarantine table) or fails the update. About 4% of calls and AI QA scores are quarantined. A broken vendor file stops the load and shows up under **Recent failed updates**."
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 0,
+      "width": 12,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "kpi-rows-in",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "sum(rows_in)",
+           "expression": "SUM(`rows_in`)"
+          },
+          {
+           "name": "daily(event_date)",
+           "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "sum(rows_in)",
+         "displayName": "Rows in",
+         "format": {
+          "type": "number",
+          "decimalPlaces": {
+           "type": "max",
+           "places": 0
+          }
+         }
+        },
+        "period": {
+         "fieldName": "daily(event_date)"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Rows in",
+        "description": "Rows that arrived in bronze, selected days and datasets",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 2,
+      "width": 3,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "kpi-passed",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "measure(Passed share)",
+           "expression": "MEASURE(`Passed share`)"
+          },
+          {
+           "name": "daily(event_date)",
+           "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "measure(Passed share)",
+         "displayName": "Passed",
+         "format": {
+          "type": "number-percent",
+          "decimalPlaces": {
+           "type": "max",
+           "places": 1
+          }
+         }
+        },
+        "period": {
+         "fieldName": "daily(event_date)"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Passed",
+        "description": "Share of rows that passed every drop rule",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 3,
+      "y": 2,
+      "width": 3,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "kpi-dropped",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "measure(Dropped share)",
+           "expression": "MEASURE(`Dropped share`)"
+          },
+          {
+           "name": "daily(event_date)",
+           "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "measure(Dropped share)",
+         "displayName": "Dropped",
+         "format": {
+          "type": "number-percent",
+          "decimalPlaces": {
+           "type": "max",
+           "places": 1
+          }
+         }
+        },
+        "period": {
+         "fieldName": "daily(event_date)"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Dropped",
+        "description": "Share of rows kept out of silver by a drop rule",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 6,
+      "y": 2,
+      "width": 3,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "kpi-quarantined",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "measure(Quarantined share)",
+           "expression": "MEASURE(`Quarantined share`)"
+          },
+          {
+           "name": "daily(event_date)",
+           "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "measure(Quarantined share)",
+         "displayName": "Quarantined",
+         "format": {
+          "type": "number-percent",
+          "decimalPlaces": {
+           "type": "max",
+           "places": 1
+          }
+         }
+        },
+        "period": {
+         "fieldName": "daily(event_date)"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Quarantined",
+        "description": "Share of calls + quality_scores rows kept, with reasons, in the quarantine tables",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 9,
+      "y": 2,
+      "width": 3,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "daily-stages",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_daily_stages",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          },
+          {
+           "name": "sum(rows)",
+           "expression": "SUM(`rows`)"
+          },
+          {
+           "name": "stage",
+           "expression": "`stage`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "bar",
+       "encodings": {
+        "x": {
+         "fieldName": "event_date",
+         "scale": {
+          "type": "temporal"
+         },
+         "displayName": "Day"
+        },
+        "y": {
+         "fieldName": "sum(rows)",
+         "scale": {
+          "type": "quantitative"
+         },
+         "displayName": "Rows"
+        },
+        "color": {
+         "fieldName": "stage",
+         "displayName": "Outcome",
+         "scale": {
+          "type": "categorical",
+          "mappings": [
+           {
+            "value": "passed",
+            "color": "#2F9E44"
+           },
+           {
+            "value": "dropped",
+            "color": "#E8590C"
+           }
+          ]
+         }
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Rows per day: passed vs dropped",
+        "description": "Dropped rows go to quarantine (calls, quality_scores) or are dropped (short transcripts)",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 5,
+      "width": 6,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "recent-failed-updates",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_failures",
+         "fields": [
+          {
+           "name": "event_ts",
+           "expression": "`event_ts`"
+          },
+          {
+           "name": "pipeline",
+           "expression": "`pipeline`"
+          },
+          {
+           "name": "expectation",
+           "expression": "`expectation`"
+          },
+          {
+           "name": "table_name",
+           "expression": "`table_name`"
+          },
+          {
+           "name": "example_record",
+           "expression": "`example_record`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "event_ts",
+          "displayName": "When"
+         },
+         {
+          "fieldName": "pipeline",
+          "displayName": "Pipeline"
+         },
+         {
+          "fieldName": "expectation",
+          "displayName": "Rule"
+         },
+         {
+          "fieldName": "table_name",
+          "displayName": "Table"
+         },
+         {
+          "fieldName": "example_record",
+          "displayName": "Example record"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Recent failed updates",
+        "description": "From the pipeline event logs. Empty until a FAIL rule stops an update (Act 4).",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 6,
+      "y": 5,
+      "width": 6,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "failures-by-rule",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_rule_failures",
+         "fields": [
+          {
+           "name": "sum(failures)",
+           "expression": "SUM(`failures`)"
+          },
+          {
+           "name": "rule_name",
+           "expression": "`rule_name`"
+          },
+          {
+           "name": "action",
+           "expression": "`action`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "bar",
+       "encodings": {
+        "x": {
+         "fieldName": "sum(failures)",
+         "scale": {
+          "type": "quantitative"
+         },
+         "displayName": "Failing rows (failed updates for FAIL)"
+        },
+        "y": {
+         "fieldName": "rule_name",
+         "scale": {
+          "type": "categorical",
+          "sort": {
+           "by": "value"
+          }
+         },
+         "displayName": "Rule"
+        },
+        "color": {
+         "fieldName": "action",
+         "displayName": "Action",
+         "scale": {
+          "type": "categorical",
+          "mappings": [
+           {
+            "value": "warn",
+            "color": "#F2A900"
+           },
+           {
+            "value": "drop",
+            "color": "#E8590C"
+           },
+           {
+            "value": "fail",
+            "color": "#9B1C1C"
+           }
+          ]
+         }
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Failures by rule, colored by action",
+        "description": "Warn keeps the row, drop quarantines it, fail stops the update. FAIL rules count failed updates.",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 10,
+      "width": 6,
+      "height": 7
+     }
+    },
+    {
+     "widget": {
+      "name": "failure-rate-hourly",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_rate_hourly",
+         "fields": [
+          {
+           "name": "hourly(hour)",
+           "expression": "DATE_TRUNC(\"HOUR\", `hour`)"
+          },
+          {
+           "name": "max(failure_rate)",
+           "expression": "MAX(`failure_rate`)"
+          },
+          {
+           "name": "rule",
+           "expression": "`rule`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "line",
+       "encodings": {
+        "x": {
+         "fieldName": "hourly(hour)",
+         "scale": {
+          "type": "temporal"
+         },
+         "displayName": "Hour"
+        },
+        "y": {
+         "fieldName": "max(failure_rate)",
+         "scale": {
+          "type": "quantitative"
+         },
+         "displayName": "Failure rate",
+         "format": {
+          "type": "number-percent",
+          "decimalPlaces": {
+           "type": "max",
+           "places": 1
+          }
+         }
+        },
+        "color": {
+         "fieldName": "rule",
+         "scale": {
+          "type": "categorical"
+         },
+         "displayName": "Table.rule"
+        }
+       },
+       "annotations": [
+        {
+         "type": "horizontal-line",
+         "encodings": {
+          "y": {
+           "dataValue": "0.05",
+           "dataType": "DOUBLE"
+          },
+          "label": {
+           "value": "5% alert threshold"
+          },
+          "color": {
+           "value": "#9B1C1C"
+          }
+         }
+        }
+       ],
+       "frame": {
+        "showTitle": true,
+        "title": "Failure rate per rule per hour (top 8)",
+        "description": "From the expectation metrics in the event logs. The SQL alert fires above 5%.",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 6,
+      "y": 10,
+      "width": 6,
+      "height": 7
+     }
+    },
+    {
+     "widget": {
+      "name": "quarantine-heading",
+      "multilineTextboxSpec": {
+       "lines": [
+        "## Quarantine explorer\n",
+        "\n",
+        "Every quarantined row with the rules it broke and the file it came from. Pick a rule to drill in."
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 17,
+      "width": 8,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "filter-rule",
+      "queries": [
+       {
+        "name": "q_rule",
+        "query": {
+         "datasetName": "ds_quarantine",
+         "fields": [
+          {
+           "name": "rule_name",
+           "expression": "`rule_name`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "filter-multi-select",
+       "encodings": {
+        "fields": [
+         {
+          "fieldName": "rule_name",
+          "displayName": "Rule",
+          "queryName": "q_rule"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Rule"
+       }
+      }
+     },
+     "position": {
+      "x": 8,
+      "y": 17,
+      "width": 4,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "quarantine-table",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_quarantine",
+         "fields": [
+          {
+           "name": "_loaded_at",
+           "expression": "`_loaded_at`"
+          },
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          },
+          {
+           "name": "call_id",
+           "expression": "`call_id`"
+          },
+          {
+           "name": "rule_name",
+           "expression": "`rule_name`"
+          },
+          {
+           "name": "key_columns",
+           "expression": "`key_columns`"
+          },
+          {
+           "name": "source_file",
+           "expression": "`source_file`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "_loaded_at",
+          "displayName": "Loaded at"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset"
+         },
+         {
+          "fieldName": "call_id",
+          "displayName": "call_id"
+         },
+         {
+          "fieldName": "rule_name",
+          "displayName": "Failed rule"
+         },
+         {
+          "fieldName": "key_columns",
+          "displayName": "Key columns"
+         },
+         {
+          "fieldName": "source_file",
+          "displayName": "Source file"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Quarantined rows, newest first",
+        "description": "calls_quarantine + quality_scores_quarantine (latest 2,000 rows)",
+        "showDescription": true
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 19,
+      "width": 12,
+      "height": 8
+     }
+    }
+   ]
+  },
+  {
+   "name": "filters",
+   "displayName": "Filters",
+   "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+   "layoutVersion": "GRID_V1",
+   "layout": [
+    {
+     "widget": {
+      "name": "filter-date",
+      "queries": [
+       {
+        "name": "q_event_date_ds_daily",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_event_date_ds_daily_stages",
+        "query": {
+         "datasetName": "ds_daily_stages",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_event_date_ds_rule_failures",
+        "query": {
+         "datasetName": "ds_rule_failures",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_event_date_ds_rate_hourly",
+        "query": {
+         "datasetName": "ds_rate_hourly",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_event_date_ds_quarantine",
+        "query": {
+         "datasetName": "ds_quarantine",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_event_date_ds_failures",
+        "query": {
+         "datasetName": "ds_failures",
+         "fields": [
+          {
+           "name": "event_date",
+           "expression": "`event_date`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "filter-date-range-picker",
+       "encodings": {
+        "fields": [
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_daily"
+         },
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_daily_stages"
+         },
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_rule_failures"
+         },
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_rate_hourly"
+         },
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_quarantine"
+         },
+         {
+          "fieldName": "event_date",
+          "displayName": "Date range",
+          "queryName": "q_event_date_ds_failures"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Date range"
+       },
+       "selection": {
+        "defaultSelection": {
+         "range": {
+          "dataType": "DATE",
+          "min": {
+           "value": "now-7d/d"
+          },
+          "max": {
+           "value": "now/d"
+          }
+         }
+        }
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 0,
+      "width": 2,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "filter-dataset",
+      "queries": [
+       {
+        "name": "q_dataset_ds_daily",
+        "query": {
+         "datasetName": "ds_daily",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_dataset_ds_daily_stages",
+        "query": {
+         "datasetName": "ds_daily_stages",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_dataset_ds_rule_failures",
+        "query": {
+         "datasetName": "ds_rule_failures",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_dataset_ds_rate_hourly",
+        "query": {
+         "datasetName": "ds_rate_hourly",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_dataset_ds_quarantine",
+        "query": {
+         "datasetName": "ds_quarantine",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       },
+       {
+        "name": "q_dataset_ds_failures",
+        "query": {
+         "datasetName": "ds_failures",
+         "fields": [
+          {
+           "name": "dataset",
+           "expression": "`dataset`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "filter-multi-select",
+       "encodings": {
+        "fields": [
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_daily"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_daily_stages"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_rule_failures"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_rate_hourly"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_quarantine"
+         },
+         {
+          "fieldName": "dataset",
+          "displayName": "Dataset",
+          "queryName": "q_dataset_ds_failures"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Dataset"
+       }
+      }
+     },
+     "position": {
+      "x": 2,
+      "y": 0,
+      "width": 2,
+      "height": 2
+     }
+    }
+   ]
+  }
+ ],
+ "uiSettings": {
+  "theme": {
+   "canvasBackgroundColor": {
+    "light": "#F5F8FB",
+    "dark": "#1F272D"
+   },
+   "widgetBackgroundColor": {
+    "light": "#FFFFFF",
+    "dark": "#11171C"
+   },
+   "widgetBorderColor": {
+    "light": "#FFFFFF",
+    "dark": "#11171C"
+   },
+   "fontColor": {
+    "light": "#11171C",
+    "dark": "#E8ECF0"
+   },
+   "selectionColor": {
+    "light": "#2272B4",
+    "dark": "#8ACAFF"
+   },
+   "visualizationColors": [
+    "#1D5C96",
+    "#F2A900",
+    "#E8590C",
+    "#7048E8",
+    "#2F9E44",
+    "#0C8599",
+    "#C2255C",
+    "#9B1C1C"
+   ],
+   "widgetHeaderAlignment": "LEFT"
+  }
+ }
+}

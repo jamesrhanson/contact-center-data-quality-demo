@@ -1,0 +1,296 @@
+# Contact Center Data Quality (_1e53d4): Lakeflow Declarative Pipelines data quality
+# for a health plan's contact center data. Warn / drop / fail rules sit next to the
+# pipeline code; quarantine tables keep the rejected rows; a FAIL is recovered with the
+# stock Repair run or Refresh failed tables; an AI/BI dashboard and a SQL alert read the
+# published pipeline event logs.
+#
+# `bundle deploy` creates the volume, both pipelines, the 4 jobs, the dashboard and the
+# alert. `bundle run demo_reset` then fills them in: 7-day backfill + agents + dq_rules →
+# full refresh of both pipelines → monitoring views → one pipeline_job run → generator.
+#
+# The schema is NOT a bundle resource: dev mode would prefix it (dev_<user>_…) and detach
+# the bundle from the schema the demo was built in. Create it once before the first deploy
+# (see dab_instructions.md). Commands: dab_instructions.md.
+
+bundle:
+  name: cc_data_quality_1e53d4
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all demo tables and the volume
+  schema:
+    description: Schema for all demo tables and the volume (must exist before deploy)
+  warehouse_id:
+    description: SQL warehouse used by the dashboard and the alert
+  bronze_reset_allowed:
+    description: >-
+      Value of pipelines.reset.allowed on bronze tables. Bronze is the only copy
+      of what arrived, so full refresh (and demo_reset) is allowed only in dev.
+    default: "false"
+  run_as_service_principal:
+    description: Application ID of the service principal jobs/pipelines run as (required in prod)
+    default: ""
+  permissions_group:
+    description: Workspace group granted CAN_MANAGE on jobs, pipelines and the dashboard (required in prod)
+    default: ""
+  alert_cron:
+    description: Quartz schedule of the SQL alert
+    default: "0 0/5 * * * ?"
+  alert_pause_status:
+    description: >-
+      PAUSED or UNPAUSED. Ships PAUSED: while unpaused, the alert runs every 5 minutes
+      and keeps the SQL warehouse awake (and billing).
+    default: "PAUSED"
+
+# Only src/ (pipeline, job, SQL and dashboard sources) is needed in the workspace.
+# The project root also holds docs; only src/ is synced.
+sync:
+  include:
+    - "src/**"
+  exclude:
+    - ".databrickscfg"
+    - "architecture.*"
+    - "README.md"
+    - "dab_instructions.md"
+
+targets:
+  dev:
+    default: true
+    mode: development   # prefixes job / pipeline / dashboard names with `[dev <user>] `;
+                        # tables and the volume keep their names.
+    # Pass your own values: --var catalog=<catalog> --var schema=<schema> --var warehouse_id=<id>
+    variables:
+      bronze_reset_allowed: "true"
+
+  staging:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      bronze_reset_allowed: "false"
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      bronze_reset_allowed: "false"
+    run_as:
+      service_principal_name: ${var.run_as_service_principal}
+    permissions:
+      - group_name: ${var.permissions_group}
+        level: CAN_MANAGE
+    resources:
+      dashboards:
+        dq_dashboard:
+          # Embedded credentials can't be combined with a run_as identity other than the
+          # deployer, so in prod viewers query with their own credentials.
+          embed_credentials: false
+
+resources:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Volume: landing/ (Auto Loader source), held_out/calls/ (the Act 4 bad file),
+  # rejected/calls/ (where the presenter sets the bad file aside).
+  # ──────────────────────────────────────────────────────────────────────────
+  volumes:
+    cc_files:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.schema}
+      name: cc_files_1e53d4
+      volume_type: MANAGED
+      comment: "Contact center landing files: landing/, held_out/calls/, rejected/calls/"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Pipelines: serverless, triggered, each publishes its event log to UC.
+  # ──────────────────────────────────────────────────────────────────────────
+  pipelines:
+    ingestion:
+      name: cc_dq_ingestion_1e53d4
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      continuous: false
+      channel: CURRENT
+      root_path: ./src/pipelines/ingestion
+      libraries:
+        - glob:
+            include: ./src/pipelines/ingestion/**
+      configuration:
+        # bronze.sql reads ${landing_path}; calls_raw holds the one FAIL contract rule.
+        landing_path: /Volumes/${var.catalog}/${var.schema}/cc_files_1e53d4/landing
+        bronze_reset_allowed: ${var.bronze_reset_allowed}
+        # A contract FAIL is deterministic: retrying the update can't fix it. Fail fast so the
+        # job stops at "ingestion" and the presenter recovers with Repair run / Refresh failed tables.
+        pipelines.numUpdateRetryAttempts: "0"
+      event_log:
+        catalog: ${var.catalog}
+        schema: ${var.schema}
+        name: ingestion_event_log
+
+    transformation:
+      name: cc_dq_transformation_1e53d4
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      continuous: false
+      channel: CURRENT
+      root_path: ./src/pipelines/transformation
+      libraries:
+        - glob:
+            include: ./src/pipelines/transformation/**
+      configuration:
+        # quality_scores.py loads its rules from ${catalog}.${schema}.dq_rules, grouped by action.
+        catalog: ${var.catalog}
+        schema: ${var.schema}
+        pipelines.numUpdateRetryAttempts: "0"
+      event_log:
+        catalog: ${var.catalog}
+        schema: ${var.schema}
+        name: transformation_event_log
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Dashboard: dataset queries use bare table names; catalog/schema bound per target.
+  # ──────────────────────────────────────────────────────────────────────────
+  dashboards:
+    dq_dashboard:
+      display_name: Contact Center Data Quality _1e53d4
+      file_path: ./src/dashboards/contact_center_dq.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      dataset_catalog: ${var.catalog}
+      dataset_schema: ${var.schema}
+      embed_credentials: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # SQL alert (alerts v2). Same SQL as src/sql/queries/dq_alert_breaches.sql.
+  # Two triggers, because a FAIL records no expectation metrics for the failed update:
+  #  1) quarantine share > 5% in the last hour (calls or quality_scores)  -> slow drift
+  #  2) any failed pipeline update in the last hour (dq_pipeline_failures) -> incident
+  # ──────────────────────────────────────────────────────────────────────────
+  alerts:
+    dq_alert:
+      display_name: cc_dq_alert_1e53d4
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        -- cc_dq_alert_1e53d4: fires when breaches > 0.
+        -- A FAIL records no expectation metrics for that update, so we alert on the quarantine
+        -- share AND on the failure event itself.
+        WITH share AS (
+          SELECT 'calls_quarantine' AS quarantine_table,
+                 (SELECT count(*) FROM ${var.catalog}.${var.schema}.calls_quarantine WHERE _ingested_at >= current_timestamp() - INTERVAL 1 HOUR) AS quarantined,
+                 (SELECT count(*) FROM ${var.catalog}.${var.schema}.calls_raw WHERE _ingested_at >= current_timestamp() - INTERVAL 1 HOUR) AS rows_in
+          UNION ALL
+          SELECT 'quality_scores_quarantine',
+                 (SELECT count(*) FROM ${var.catalog}.${var.schema}.quality_scores_quarantine WHERE _ingested_at >= current_timestamp() - INTERVAL 1 HOUR),
+                 (SELECT count(*) FROM ${var.catalog}.${var.schema}.quality_scores_raw WHERE _ingested_at >= current_timestamp() - INTERVAL 1 HOUR)
+        ),
+        share_breach AS (
+          SELECT count_if(rows_in > 0 AND quarantined / rows_in > 0.05) AS n,
+                 concat_ws(', ', collect_list(IF(rows_in > 0 AND quarantined / rows_in > 0.05,
+                   concat(quarantine_table, ' ', round(100 * quarantined / rows_in, 1), '%'), NULL))) AS detail
+          FROM share
+        ),
+        fail AS (
+          SELECT count(*) AS n,
+                 concat_ws(', ', collect_set(concat(coalesce(expectation, 'error'), ' on ', table_name))) AS detail
+          FROM ${var.catalog}.${var.schema}.dq_pipeline_failures
+          WHERE event_ts >= current_timestamp() - INTERVAL 1 HOUR
+        )
+        SELECT (SELECT n FROM share_breach) + IF((SELECT n FROM fail) > 0, 1, 0) AS breaches,
+               (SELECT detail FROM share_breach) AS quarantine_share_breaches,
+               (SELECT n FROM fail) AS failed_updates_last_hour,
+               (SELECT detail FROM fail) AS failed_rules
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: breaches
+          display: breaches
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: true
+      schedule:
+        quartz_cron_schedule: ${var.alert_cron}
+        timezone_id: UTC
+        pause_status: ${var.alert_pause_status}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Jobs
+  # ──────────────────────────────────────────────────────────────────────────
+  jobs:
+    pipeline_job:
+      name: cc_dq_pipeline_job_1e53d4
+      description: "ingestion → transformation. Act 4 fails at ingestion; recover with Repair run."
+      max_concurrent_runs: 1
+      # Presenter uses "Run now"; the schedule stays PAUSED so no scheduled run
+      # can recover a failure before the "Repair run" beat.
+      schedule:
+        quartz_cron_expression: "0 0/10 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: ingestion
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.ingestion.id}
+        - task_key: transformation
+          depends_on:
+            - task_key: ingestion
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.transformation.id}
+
+    generator:
+      name: cc_dq_generator_1e53d4
+      description: "Writes a small batch of calls / transcripts / quality_scores to landing/ every minute."
+      max_concurrent_runs: 1
+      timeout_seconds: 7500
+      parameters:
+        - name: volume_root
+          default: /Volumes/${var.catalog}/${var.schema}/cc_files_1e53d4
+        - name: max_minutes
+          default: "120"
+        - name: interval_seconds
+          default: "60"
+      tasks:
+        - task_key: generate
+          notebook_task:
+            notebook_path: ./src/jobs/generator.py
+
+    bad_batch_in:
+      name: cc_dq_bad_batch_in_1e53d4
+      description: "Act 4: moves the held-out vendor file (missing required columns) into landing/calls/."
+      max_concurrent_runs: 1
+      parameters:
+        - name: volume_root
+          default: /Volumes/${var.catalog}/${var.schema}/cc_files_1e53d4
+      tasks:
+        - task_key: move_bad_batch_in
+          notebook_task:
+            notebook_path: ./src/jobs/bad_batch_in.py
+
+    demo_reset:
+      name: cc_dq_demo_reset_1e53d4
+      description: "Setup + reset (dev only): backfill, agents, dq_rules, full refresh, monitoring views, pipeline run, generator."
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume_root
+          default: /Volumes/${var.catalog}/${var.schema}/cc_files_1e53d4
+        - name: bronze_reset_allowed
+          default: ${var.bronze_reset_allowed}
+        - name: ingestion_pipeline_id
+          default: ${resources.pipelines.ingestion.id}
+        - name: transformation_pipeline_id
+          default: ${resources.pipelines.transformation.id}
+        - name: pipeline_job_id
+          default: ${resources.jobs.pipeline_job.id}
+        - name: generator_job_id
+          default: ${resources.jobs.generator.id}
+        - name: start_generator
+          default: "true"
+      tasks:
+        - task_key: reset
+          notebook_task:
+            notebook_path: ./src/jobs/demo_reset.py
